@@ -1,4 +1,3 @@
-# api.py
 import logging
 from functools import lru_cache
 from fastapi import APIRouter, Depends, HTTPException
@@ -12,9 +11,7 @@ from services import ChatService
 router = APIRouter()
 
 # --- Dependency Injection ---
-# This is the key to good FastAPI design.
-# We use @lru_cache to create a *single instance* of the service
-# and re-use it for every request. This is efficient.
+# Use a cached single instance of ChatService for performance
 @lru_cache
 def get_chat_service(settings: Settings = Depends(get_settings)) -> ChatService:
     """
@@ -29,26 +26,31 @@ async def handle_chat(
     chat_service: ChatService = Depends(get_chat_service)
 ):
     """
-    The main chat endpoint for your Next.js frontend.
+    Main chat endpoint for the frontend.
+    Uses the ChatService to handle NLU + RAG processing and generate a response.
     """
     try:
+        # --- Core processing ---
+        # request.message → user text
         response_text, intent, context = chat_service.get_chat_response(request)
         
+        # --- Return structured output ---
         return ChatResponse(
             response=response_text,
             detected_intent=intent,
             retrieved_context=context
         )
-        
+
+    # --- Error Handling ---
     except OpenAIError as e:
-        logging.error(f"An error occurred with the AI service: {e}")
+        logging.error(f"AI service error: {e}")
         raise HTTPException(
-            status_code=503, # 503 Service Unavailable
-            detail=f"The AI service is currently unavailable. Please try again later."
+            status_code=503,
+            detail="The AI service is currently unavailable. Please try again later."
         )
     except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}")
+        logging.error(f"Unexpected server error: {e}")
         raise HTTPException(
-            status_code=500, # 500 Internal Server Error
+            status_code=500,
             detail="An unexpected server error occurred."
         )

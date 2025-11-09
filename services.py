@@ -4,10 +4,14 @@ from openai import AzureOpenAI, OpenAIError
 from config import Settings
 from schemas import ChatRequest
 
+# ✅ NEW IMPORTS for your custom NLU & RAG logic
+from nlu.intent_emotion import analyze_text
+from rag.retriever import retrieve_relevant
+
 # Set up a logger
 logger = logging.getLogger(__name__)
 
-# This will store chat histories.
+# This will store chat histories (simple in-memory cache)
 CHAT_HISTORY_CACHE = {}
 
 
@@ -26,61 +30,65 @@ class ChatService:
                 azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
             )
             self.deployment_name = settings.AZURE_OPENAI_DEPLOYMENT_NAME
-            logger.info("AzureOpenAI client initialized successfully.")
+            logger.info("✅ AzureOpenAI client initialized successfully.")
         except Exception as e:
-            logger.error(f"Failed to initialize AzureOpenAI client: {e}")
+            logger.error(f"❌ Failed to initialize AzureOpenAI client: {e}")
             self.client = None
 
+    # ---------------------------------------------
+    # 🔹 Optional mock NLU (kept for fallback use)
+    # ---------------------------------------------
     def _mock_rasa_nlu(self, message: str) -> dict:
         """
         [MOCK] Simulates a call to a Rasa NLU server.
         """
         logger.info(f"Mock NLU processing message: {message}")
         message_lower = message.lower()
-        
+
         if "yes" in message_lower or "ok" in message_lower or "sure" in message_lower:
             return {"intent": {"name": "affirm"}, "entities": []}
         if "no" in message_lower or "not really" in message_lower:
             return {"intent": {"name": "deny"}, "entities": []}
-            
         if "job" in message_lower or "deadline" in message_lower or "work" in message_lower:
             return {"intent": {"name": "work_stress"}, "entities": []}
         if "exam" in message_lower or "study" in message_lower:
             return {"intent": {"name": "study_anxiety"}, "entities": []}
         if "sad" in message_lower or "lonely" in message_lower:
             return {"intent": {"name": "feeling_depressed"}, "entities": []}
+
         return {"intent": {"name": "general_greeting"}, "entities": []}
 
+    # ---------------------------------------------
+    # 🔹 Optional mock RAG retriever (fallback)
+    # ---------------------------------------------
     def _mock_rag_retriever(self, intent: str) -> str:
         """
         [MOCK] Simulates a RAG query to a vector database.
         """
         logger.info(f"Mock RAG retrieving for intent: {intent}")
         rag_db = {
-            "work_stress": "Retrieved technique: 'The 5-4-3-2-1 grounding technique. Focus on five things you see, four things you feel, three things you hear, two things you smell, and one thing you taste. This helps anchor you to the present moment.'",
-            "study_anxiety": "Retrieved technique: 'The Pomodoro Technique. Break your study time into 25-minute focused intervals, followed by a 5-minute break. This makes the task less daunting.'",
-            "feeling_depressed": "Retrieved affirmation: 'It's okay to not be okay. Your feelings are valid. Remind the user to be kind to themselves and that this feeling will pass.'",
-            "general_greeting": "Retrieved context: 'User is starting the conversation. Be warm and welcoming. Ask an open-ended question about how they are feeling today.'",
-            "affirm": "Retrieved context: 'The user has agreed to a suggestion. Be encouraging and proceed with the next step.'",
-            "deny": "Retrieved context: 'The user has declined a suggestion. Be gentle, validate their choice, and offer an alternative, like just talking.'"
+            "work_stress": "Retrieved technique: 'Try the 5-4-3-2-1 grounding technique to relax.'",
+            "study_anxiety": "Retrieved tip: 'Use the Pomodoro Technique — 25 min study + 5 min break.'",
+            "feeling_depressed": "Retrieved affirmation: 'It's okay to not be okay. Be kind to yourself.'",
+            "general_greeting": "Retrieved context: 'Be warm and welcoming. Ask how they’re feeling today.'",
+            "affirm": "Retrieved context: 'The user agreed. Continue positively.'",
+            "deny": "Retrieved context: 'The user declined. Offer gentle alternatives.'"
         }
-        return rag_db.get(intent, "Retrieved context: 'Acknowledge the user's statement and ask a gentle, clarifying question.'")
+        return rag_db.get(intent, "Retrieved context: 'Acknowledge and respond empathetically.'")
 
+    # ---------------------------------------------
+    # 🔹 Build the LLM prompt (with context + history)
+    # ---------------------------------------------
     def _build_llm_prompt(self, message: str, intent: str, context: str, history: list[dict]) -> list[dict]:
         """
-        Builds the structured prompt for the LLM, now including history.
+        Builds the structured prompt for the LLM, including conversation history.
         """
-        
-        # --- !! NAME CHANGE IS HERE !! ---
         SYSTEM_PROMPT = (
-            "You are 'Luma', an AI emotional support chatbot. Your role is to "
-            "help working professionals and students navigate stress and negative emotions. "
-            "You are empathetic, patient, and non-judgmental. "
+            "You are 'Luma', an empathetic AI emotional support chatbot for students and professionals. "
+            "Help users express and regulate emotions. "
             "NEVER give medical advice. "
-            "Use the 'Retrieved Context' to help guide your response. "
-            "The 'User Intent' is for your information. Do not mention it explicitly. "
-            "Keep your responses concise, supportive, and end with a question "
-            "to encourage the user to keep talking."
+            "Use the retrieved context and detected intent internally to guide your tone. "
+            "End your responses with an open-ended question to keep the user engaged."
         )
 
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -89,63 +97,74 @@ class ChatService:
             "role": "user",
             "content": (
                 f"User Message: \"{message}\"\n\n"
-                f"--- (Internal analysis) ---\n"
+                f"--- (Internal info) ---\n"
                 f"User Intent: {intent}\n"
                 f"Retrieved Context: {context}\n"
-                f"--- (End analysis) ---\n\n"
+                f"--- (End info) ---\n\n"
                 f"Your response:"
             )
         })
-        
         return messages
 
+    # ---------------------------------------------
+    # 🔹 Main function: generates chatbot response
+    # ---------------------------------------------
     def get_chat_response(self, request: ChatRequest) -> tuple[str, str, str]:
         """
-        Main orchestration function.
+        Main orchestration: NLU → RAG → LLM → Response
         """
         if not self.client:
-            logger.error("LLM client is not initialized. Cannot process request.")
+            logger.error("❌ LLM client not initialized.")
             raise OpenAIError("The AI service is not configured correctly.")
-            
-        session_id = request.session_id
-        if not session_id:
-            logger.warning("No session_id provided. Using 'default' session.")
-            session_id = "default_session"
 
-        # 1. Get history from cache
+        session_id = request.session_id or "default_session"
+
+        # 1️⃣ Load chat history
         history = CHAT_HISTORY_CACHE.get(session_id, [])
 
-        # 2. Rasa NLU Step
-        nlu_data = self._mock_rasa_nlu(request.message)
-        intent = nlu_data.get("intent", {}).get("name", "unknown")
+        # 2️⃣ NEW — NLU step using your custom module
+        try:
+            nlu_result = analyze_text(request.message)
+            intent = nlu_result.get("intent", "unknown")
+            emotion = nlu_result.get("emotion", "neutral")
+            logger.info(f"[Session: {session_id}] NLU detected intent='{intent}', emotion='{emotion}'")
+        except Exception as e:
+            logger.warning(f"⚠️ Custom NLU failed: {e}, falling back to mock.")
+            nlu_data = self._mock_rasa_nlu(request.message)
+            intent = nlu_data.get("intent", {}).get("name", "unknown")
+            emotion = "neutral"
 
-        # 3. RAG Step
-        context = self._mock_rag_retriever(intent)
-        
-        logger.info(f"[Session: {session_id}] Retrieved RAG context for intent '{intent}': {context}")
+        # 3️⃣ NEW — RAG step using your retriever
+        try:
+            retrieved_docs = retrieve_relevant(request.message)
+            context = retrieved_docs[0] if retrieved_docs else self._mock_rag_retriever(intent)
+        except Exception as e:
+            logger.warning(f"⚠️ RAG retriever failed: {e}, using mock retriever.")
+            context = self._mock_rag_retriever(intent)
 
-        # 4. LLM Generation Step
+        logger.info(f"[Session: {session_id}] RAG context: {context}")
+
+        # 4️⃣ Build LLM prompt
         prompt = self._build_llm_prompt(request.message, intent, context, history)
-        
-        logger.info(f"[Session: {session_id}] Sending full prompt to LLM: {prompt}")
 
+        # 5️⃣ Generate LLM response
         try:
             completion = self.client.chat.completions.create(
                 model=self.deployment_name,
                 messages=prompt,
                 temperature=0.7,
-                max_tokens=200,
+                max_tokens=250,
             )
-            
             llm_response = completion.choices[0].message.content.strip()
-            
-            # 5. Save to cache
+
+            # 6️⃣ Update conversation history
             history.append({"role": "user", "content": request.message})
             history.append({"role": "assistant", "content": llm_response})
             CHAT_HISTORY_CACHE[session_id] = history
 
+            logger.info(f"[Session: {session_id}] Response generated successfully.")
             return llm_response, intent, context
 
         except OpenAIError as e:
-            logger.error(f"Error calling Azure OpenAI: {e}")
+            logger.error(f"❌ Error calling Azure OpenAI: {e}")
             raise

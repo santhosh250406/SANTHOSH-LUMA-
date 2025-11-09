@@ -1,5 +1,9 @@
-# requirements.txt
+
 fastapi
-uvicorn[standard]
-pydantic-settings
-openai>=1.0.0
+uvicorn
+transformers
+sentence-transformers
+faiss-cpu
+spacy
+numpy
+pandas
